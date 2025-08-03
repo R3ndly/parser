@@ -31,7 +31,7 @@ class Url extends \yii\db\ActiveRecord
     {
         return [
             [['path'], 'required'],
-            [['path'], 'string', 'max' => 255],
+            [['path'], 'string', 'max' => 2048],
         ];
     }
 

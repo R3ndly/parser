@@ -11,8 +11,8 @@ use Yii;
  * @property string $ip
  * @property string $request_date
  * @property int $url_id
- * @property int $browser_id
- * @property int $os_id
+ * @property int|null $browser_id
+ * @property int|null $os_id
  *
  * @property Browser $browser
  * @property Os $os
@@ -35,11 +35,11 @@ class Log extends \yii\db\ActiveRecord
      */
     public function rules()
     {
-        return [
-            [['ip', 'request_date', 'url_id', 'browser_id', 'os_id'], 'required'],
+		return [
+            [['ip', 'request_date', 'url_id'], 'required'],
             [['request_date'], 'safe'],
             [['url_id', 'browser_id', 'os_id'], 'integer'],
-            [['ip'], 'string', 'max' => 15],
+            [['ip'], 'string', 'max' => 45],
             [['browser_id'], 'exist', 'skipOnError' => true, 'targetClass' => Browser::class, 'targetAttribute' => ['browser_id' => 'id']],
             [['os_id'], 'exist', 'skipOnError' => true, 'targetClass' => Os::class, 'targetAttribute' => ['os_id' => 'id']],
             [['url_id'], 'exist', 'skipOnError' => true, 'targetClass' => Url::class, 'targetAttribute' => ['url_id' => 'id']],

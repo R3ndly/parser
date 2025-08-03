@@ -1,4 +1,5 @@
 <?php
+
 namespace app\commands;
 
 use yii\console\Controller;
@@ -13,8 +14,8 @@ class ParseLogController extends Controller
 {
     public function actionIndex($filePath)
     {
-        if (!file_exists($filePath)) {
-            $this->stderr("File not found: {$filePath}\n");
+        if (!is_file($filePath) || !is_readable($filePath)) {
+            $this->stderr("File not found or not readable: {$filePath}\n");
             return ExitCode::NOINPUT;
         }
 
@@ -24,90 +25,173 @@ class ParseLogController extends Controller
             return ExitCode::IOERR;
         }
 
-        $pattern = '/^(\S+) \S+ \S+ \[([^\]]+)\] "([^"]+)" \d+ \d+ "[^"]*" "([^"]*)"$/';
         $count = 0;
+        $errors = 0;
 
         while (($line = fgets($handle)) !== false) {
-            if (preg_match($pattern, $line, $matches)) {
-                $this->processLogEntry($matches);
-                $count++;
-                
-                // Выводим прогресс каждые 100 записей
-                if ($count % 100 === 0) {
-                    $this->stdout("Processed {$count} entries...\n");
+            $line = trim($line);
+            if ($line === '') {
+                continue; // пропускаем пустые строки
+            }
+            try {
+                $parsedData = $this->parseLogLine($line);
+                if ($parsedData) {
+                    $this->processLogEntry($parsedData);
+                    $count++;
+                } else {
+                    $errors++;
+                    $this->stderr("Failed to parse line: {$line}\n");
                 }
+            } catch (\Exception $e) {
+                $errors++;
+                $this->stderr("Error processing line: {$line}\nError: {$e->getMessage()}\n");
+            }
+
+            if ($count > 0 && $count % 100 === 0) {
+                $this->stdout("Processed {$count} entries...\n");
             }
         }
 
         fclose($handle);
-        $this->stdout("Successfully processed {$count} log entries.\n");
+        $this->stdout("Successfully processed {$count} log entries with {$errors} errors.\n");
+
         return ExitCode::OK;
     }
 
-    protected function processLogEntry($matches)
+    protected function parseLogLine(string $line): ?array
     {
-        list(, $ip, $datetime, $request, $userAgent) = $matches;
-        
-        $date = DateTime::createFromFormat('d/M/Y:H:i:s O', $datetime);
+        $pattern = '/^
+            (?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+-\s+-\s+
+            \[(?P<date>[^\]]+)\]\s+
+            "(?P<method>\w+)\s+(?P<url>[^"]+)\s+(?P<protocol>[^"]+)"\s+
+            (?P<status>\d{3})\s+
+            (?P<size>\d+|-)\s+
+            "(?P<referer>[^"]*)"\s+
+            "(?P<userAgent>[^"]*)"
+        $/x';
+
+        if (!preg_match($pattern, $line, $matches)) {
+            return null;
+        }
+
+        $date = DateTime::createFromFormat('d/M/Y:H:i:s O', $matches['date']);
         if (!$date) {
-            return;
-        }
-        
-        $urlPath = $this->extractUrl($request);
-        $url = Url::findOrCreate($urlPath);
-        
-        $browserInfo = $this->parseUserAgent($userAgent);
-        $browser = Browser::findOrCreate($browserInfo['browser'], $browserInfo['version']);
-        $os = Os::findOrCreate($browserInfo['os'], $browserInfo['architecture']);
-        
-        $log = new Log();
-        $log->ip = $ip;
-        $log->request_date = $date->format('Y-m-d H:i:s');
-        $log->url_id = $url->id;
-        $log->browser_id = $browser->id;
-        $log->os_id = $os->id;
-        $log->save();
-    }
-
-    protected function extractUrl($request)
-    {
-        if (preg_match('/^(GET|POST|PUT|DELETE|HEAD|OPTIONS) (\S+)/', $request, $matches)) {
-            return $matches[2];
-        }
-        return $request;
-    }
-
-    protected function parseUserAgent($userAgent)
-    {
-        $os = 'Unknown';
-        $architecture = 'x64';
-        $browser = 'Unknown';
-        $version = '';
-
-        if (preg_match('/(Windows NT|Linux|Macintosh|Android|iOS)/', $userAgent, $matches)) {
-            $os = $matches[1];
-        }
-        
-        if (strpos($userAgent, 'x86_64') !== false || strpos($userAgent, 'WOW64') !== false) {
-            $architecture = 'x64';
-        } elseif (strpos($userAgent, 'x86') !== false || strpos($userAgent, 'Win32') !== false) {
-            $architecture = 'x86';
-        }
-
-        if (preg_match('/(Chrome|Firefox|Safari|Edge|Opera|MSIE|Trident)/', $userAgent, $matches)) {
-            $browser = $matches[1];
-            if ($browser === 'Trident') $browser = 'Internet Explorer';
-            
-            if (preg_match('/(Chrome|Firefox|Safari|Edge|Opera|MSIE|Version)\/([\d\.]+)/', $userAgent, $versionMatches)) {
-                $version = $versionMatches[2];
-            }
+            throw new \Exception("Invalid date format: " . $matches['date']);
         }
 
         return [
-            'os' => $os,
-            'architecture' => $architecture,
-            'browser' => $browser,
-            'version' => $version,
+            'ip' => $matches['ip'],
+            'date' => $date,
+            'method' => $matches['method'],
+            'url' => $matches['url'],
+            'protocol' => $matches['protocol'],
+            'status' => (int)$matches['status'],
+            'size' => $matches['size'] === '-' ? 0 : (int)$matches['size'],
+            'referer' => $matches['referer'],
+            'userAgent' => $matches['userAgent'],
         ];
     }
+
+    protected function processLogEntry(array $data): void
+    {
+        // Ограничиваем длину URL (можно увеличить или убрать, если не нужно)
+        $maxUrlLength = 1024;
+        if (mb_strlen($data['url']) > $maxUrlLength) {
+            $data['url'] = mb_substr($data['url'], 0, $maxUrlLength);
+        }
+
+        $url = Url::findOrCreate($data['url']);
+        if (!$url || !$url->id) {
+            throw new \Exception("Failed to find or create URL for path: {$data['url']}");
+        }
+
+        $uaInfo = $this->parseUserAgent($data['userAgent']);
+
+        // Если не определилась ОС или браузер, подставляем "Unknown"
+        $osName = !empty($uaInfo['os']) ? $uaInfo['os'] : 'Unknown';
+        $osArch = !empty($uaInfo['architecture']) ? $uaInfo['architecture'] : 'unknown';
+
+        $browserName = !empty($uaInfo['browser']) ? $uaInfo['browser'] : 'Unknown';
+        $browserVersion = $uaInfo['version'] ?? null;
+
+        $browser = Browser::findOrCreate($browserName, $browserVersion);
+        $os = Os::findOrCreate($osName, $osArch);
+
+        $log = new Log();
+        $log->ip = $data['ip'];
+        $log->request_date = $data['date']->format('Y-m-d H:i:s');
+        $log->url_id = $url->id;
+        $log->browser_id = $browser->id;
+        $log->os_id = $os->id;
+
+        if (!$log->save()) {
+            throw new \Exception('Failed to save log: ' . json_encode($log->errors));
+        }
+    }
+
+    protected function parseUserAgent(string $userAgent): array
+    {
+        if ($userAgent === '') {
+            return [
+                'os' => null,
+                'architecture' => null,
+                'browser' => null,
+                'version' => null,
+            ];
+        }
+
+        $result = [
+            'os' => null,
+            'architecture' => null,
+            'browser' => null,
+            'version' => null,
+        ];
+
+        if (preg_match('/\((.*?)\)/', $userAgent, $matches)) {
+            $systemInfo = $matches[1];
+            $systemParts = array_map('trim', explode(';', $systemInfo));
+
+            foreach ($systemParts as $part) {
+                if (stripos($part, 'Windows NT') !== false) {
+                    $result['os'] = 'Windows';
+                    if (stripos($part, '10.0') !== false) $result['os'] = 'Windows 10';
+                    elseif (stripos($part, '6.3') !== false) $result['os'] = 'Windows 8.1';
+                    elseif (stripos($part, '6.2') !== false) $result['os'] = 'Windows 8';
+                    elseif (stripos($part, '6.1') !== false) $result['os'] = 'Windows 7';
+                } elseif (stripos($part, 'Linux') !== false) {
+                    $result['os'] = 'Linux';
+                } elseif (stripos($part, 'Android') !== false) {
+                    $result['os'] = 'Android';
+                } elseif (stripos($part, 'iPhone') !== false || stripos($part, 'iPad') !== false) {
+                    $result['os'] = 'iOS';
+                } elseif (stripos($part, 'Macintosh') !== false) {
+                    $result['os'] = 'Mac OS';
+                }
+
+                if (stripos($part, 'x64') !== false || stripos($part, 'Win64') !== false || stripos($part, 'WOW64') !== false) {
+                    $result['architecture'] = 'x64';
+                } elseif (stripos($part, 'x86') !== false || stripos($part, 'Win32') !== false) {
+                    $result['architecture'] = 'x86';
+                } elseif (stripos($part, 'arm64') !== false || stripos($part, 'aarch64') !== false) {
+                    $result['architecture'] = 'arm64';
+                }
+            }
+        }
+
+        if (preg_match('/(Chrome|Firefox|Safari|Edge|Opera|MSIE|YaBrowser|Trident)[\/ ]([\d.]+)/i', $userAgent, $matches)) {
+            $result['browser'] = $matches[1];
+            $result['version'] = $matches[2];
+        } elseif (stripos($userAgent, 'Googlebot') !== false) {
+            $result['browser'] = 'Googlebot';
+        } elseif (stripos($userAgent, 'YandexBot') !== false) {
+            $result['browser'] = 'YandexBot';
+        }
+
+        if (stripos($userAgent, 'Chrome') !== false && stripos($userAgent, 'Mobile') !== false) {
+            $result['browser'] = 'Chrome Mobile';
+        }
+
+        return $result;
+    }
 }
+
