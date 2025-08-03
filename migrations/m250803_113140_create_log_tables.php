@@ -79,9 +79,10 @@ class m250803_113140_create_log_tables extends Migration
      */
     public function safeDown()
     {
-        echo "m250803_113140_create_log_tables cannot be reverted.\n";
-
-        return false;
+        $this->dropTable('{{%log}}');
+    	$this->dropTable('{{%url}}');
+    	$this->dropTable('{{%os}}');
+    	$this->dropTable('{{%browser}}'); 
     }
 
     /*
